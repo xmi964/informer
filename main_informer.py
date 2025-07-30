@@ -9,7 +9,7 @@ parser = argparse.ArgumentParser(description='[Informer] Long Sequences Forecast
 parser.add_argument('--model', type=str, required=True, default='informer',help='model of experiment, options: [informer, informerstack, informerlight(TBD)]')
 
 parser.add_argument('--data', type=str, required=False, default='custom', help='data name')
-parser.add_argument('--root_path', type=str, default='./data/ETT/processed', help='root path of the data file')
+parser.add_argument('--root_path', type=str, default='./data/processed', help='root path of the data file')
 parser.add_argument('--data_path', type=str, default='daily_sales.csv', help='你的数据路径')  
 parser.add_argument('--features', type=str, default='S', help='S:单变量预测, M:多变量')
 parser.add_argument('--target', type=str, default='Quantity', help='预测目标列')
@@ -39,10 +39,11 @@ parser.add_argument('--embed', type=str, default='timeF', help='time features en
 parser.add_argument('--activation', type=str, default='gelu',help='activation')
 parser.add_argument('--output_attention', action='store_true', help='whether to output attention in ecoder')
 parser.add_argument('--do_predict', action='store_true', help='whether to predict unseen future data')
+parser.add_argument('--do_test', action='store_true', help='whether to run testing')
 parser.add_argument('--mix', action='store_false', help='use mix attention in generative decoder', default=True)
 parser.add_argument('--cols', type=str, nargs='+', help='certain cols from the data files as the input features')
 parser.add_argument('--num_workers', type=int, default=0, help='data loader num workers')
-parser.add_argument('--itr', type=int, default=2, help='experiments times')
+parser.add_argument('--itr', type=int, default=1, help='experiments times')
 parser.add_argument('--train_epochs', type=int, default=6, help='train epochs')
 parser.add_argument('--batch_size', type=int, default=32, help='batch size of train input data')
 parser.add_argument('--patience', type=int, default=3, help='early stopping patience')
@@ -58,17 +59,7 @@ parser.add_argument('--gpu', type=int, default=0, help='gpu')
 parser.add_argument('--use_multi_gpu', action='store_true', help='use multiple gpus', default=False)
 parser.add_argument('--devices', type=str, default='0,1,2,3',help='device ids of multile gpus')
 
-parser.add_argument('--custom_attention', type=str, default='prob_sparse', help="prob_sparse|vanilla (默认prob_sparse)")
-parser.add_argument('--custom_decoder', action='store_true', help="启用峰值增强解码器")
-parser.add_argument('--custom_loss', type=str, default='huber', help="huber|mse (默认huber)")
-parser.add_argument('--anomaly_detection', action='store_true', help='启用异常检测功能')
-parser.add_argument('--peak_threshold', type=float, default=3.0, help='异常检测阈值（标准差倍数）')
-parser.add_argument('--use_peak_mask', action='store_true', help='使用异常掩码（从数据中自动生成）')
-parser.add_argument('--peak_weight', type=float, default=3.0, help='Weight for peak attention')
-
 args = parser.parse_args()
-args.custom_decoder = True  # 默认启用（或通过命令行）
-exp = Exp_Informer(args)
 args.use_gpu = True if torch.cuda.is_available() and args.use_gpu else False
 
 if args.use_gpu and args.use_multi_gpu:
@@ -85,31 +76,18 @@ data_parser = {
     'WTH':{'data':'WTH.csv','T':'WetBulbCelsius','M':[12,12,12],'S':[1,1,1],'MS':[12,12,1]},
     'ECL':{'data':'ECL.csv','T':'MT_320','M':[321,321,321],'S':[1,1,1],'MS':[321,321,1]},
     'Solar':{'data':'solar_AL.csv','T':'POWER_136','M':[137,137,137],'S':[1,1,1],'MS':[137,137,1]},
+    'custom':{'data':args.data_path,'T':args.target,'M':[args.enc_in]*3,'S':[1,1,1],'MS':[args.enc_in,args.enc_in,1]}
 }
 
-# 新增: 处理自定义数据的输入维度
-if args.data == 'custom':
-    if args.features == 'S':
-        # 单变量模式: 目标值 + 波动特征 + 峰值标记
-        args.enc_in = args.dec_in = args.c_out = 3
-    elif args.features == 'MS':
-        # 多变量模式: 所有特征 + 波动特征 + 峰值标记
-        # 注意: 需要根据实际数据列数调整
-        args.enc_in = args.dec_in = args.c_out = len(args.cols) + 2 if args.cols else 10
+if args.data in data_parser:
+    data_info = data_parser[args.data]
+    args.data_path = data_info['data']
+    args.target = data_info['T']
+    args.enc_in, args.dec_in, args.c_out = data_info[args.features]
 
 args.s_layers = [int(s_l) for s_l in args.s_layers.replace(' ','').split(',')]
 args.detail_freq = args.freq
 args.freq = args.freq[-1:]
-
-# 设置异常检测相关参数
-if args.anomaly_detection:
-    print("[异常检测] 已启用异常检测功能，阈值:", args.peak_threshold)
-    args.custom_attention = 'anomaly'  # 使用异常注意力机制
-    args.custom_decoder = True         # 启用自定义解码器
-    args.use_peak_mask = True          # 使用异常掩码
-    if args.loss == 'mse':
-        print("[异常检测] 将损失函数从 MSE 切换为 MSPE 以更好地处理异常")
-        args.loss = 'mspe'  # 对异常更敏感的损失函数
 
 print('Args in experiment:')
 print(args)
@@ -117,16 +95,12 @@ print(args)
 Exp = Exp_Informer
 
 for ii in range(args.itr):
-    # setting record of experiments
-    setting = '{}_{}_ft{}_sl{}_ll{}_pl{}_dm{}_nh{}_el{}_dl{}_df{}_at{}_fc{}_eb{}_dt{}_mx{}_ad{}_pt{}_{}_{}'.format(
+    setting = '{}_{}_ft{}_sl{}_ll{}_pl{}_dm{}_nh{}_el{}_dl{}_df{}_at{}_fc{}_eb{}_dt{}_mx{}_{}_{}'.format(
         args.model, args.data, args.features, 
         args.seq_len, args.label_len, args.pred_len,
-        args.d_model, args.n_heads, args.e_layers, args.d_layers, args.d_ff, args.attn, args.factor, 
-        args.embed, args.distil, args.mix,
-        'ad' if args.anomaly_detection else 'noad',  # 添加异常检测标记
-        args.peak_threshold if args.anomaly_detection else 'na',  # 添加阈值信息
-        args.des, ii
-    )
+        args.d_model, args.n_heads, args.e_layers, args.d_layers, args.d_ff, 
+        args.attn, args.factor, args.embed, args.distil, args.mix,
+        args.des, ii)
 
     exp = Exp(args) # set experiments
     print('>>>>>>>start training : {}>>>>>>>>>>>>>>>>>>>>>>>>>>'.format(setting))

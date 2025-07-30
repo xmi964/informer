@@ -5,28 +5,35 @@ import torch.nn.functional as F
 class ConvLayer(nn.Module):
     def __init__(self, c_in):
         super(ConvLayer, self).__init__()
-        padding = 1 if torch.__version__>='1.5.0' else 2
+        padding = 1 if torch.__version__ >= '1.5.0' else 2
         self.downConv = nn.Conv1d(in_channels=c_in,
-                                  out_channels=c_in,
-                                  kernel_size=3,
-                                  padding=padding,
-                                  padding_mode='circular')
+                                 out_channels=c_in,
+                                 kernel_size=3,
+                                 padding=padding,
+                                 padding_mode='circular')
         self.norm = nn.BatchNorm1d(c_in)
         self.activation = nn.ELU()
         self.maxPool = nn.MaxPool1d(kernel_size=3, stride=2, padding=1)
 
     def forward(self, x):
-        x = self.downConv(x.permute(0, 2, 1))
+        # 输入x形状应为[B, L, C]
+        if x.dim() == 4:  # 如果输入是[B, L, H, D]
+            B, L, H, D = x.shape
+            x = x.reshape(B, L, -1)  # 合并最后两个维度
+        
+        # 维度转换 [B, L, C] -> [B, C, L]
+        x = x.permute(0, 2, 1)
+        x = self.downConv(x)
         x = self.norm(x)
         x = self.activation(x)
         x = self.maxPool(x)
-        x = x.transpose(1,2)
-        return x
+        # 转换回 [B, L, C]
+        return x.permute(0, 2, 1)
 
 class EncoderLayer(nn.Module):
     def __init__(self, attention, d_model, d_ff=None, dropout=0.1, activation="relu"):
         super(EncoderLayer, self).__init__()
-        d_ff = d_ff or 4*d_model
+        d_ff = d_ff or 4 * d_model
         self.attention = attention
         self.conv1 = nn.Conv1d(in_channels=d_model, out_channels=d_ff, kernel_size=1)
         self.conv2 = nn.Conv1d(in_channels=d_ff, out_channels=d_model, kernel_size=1)
@@ -35,42 +42,36 @@ class EncoderLayer(nn.Module):
         self.dropout = nn.Dropout(dropout)
         self.activation = F.relu if activation == "relu" else F.gelu
 
-    def forward(self, x, attn_mask=None, peak_mask=None):
-        # 1. 注意力计算（传递 peak_mask）
+    def forward(self, x, attn_mask=None):
+        # 输入维度检查
+        original_shape = x.shape
+        if x.dim() == 4:  # [B, L, H, D]
+            B, L, H, D = x.shape
+            x = x.reshape(B, L, -1)  # 合并最后两个维度
+        
+        # Attention处理
         new_x, attn = self.attention(
-            x, x, x,
-            attn_mask=attn_mask,
-            peak_mask=peak_mask
+            queries=x,
+            keys=x,
+            values=x,
+            attn_mask=attn_mask
         )
         
-        # 2. 异常点加权（关键修改点）
-        if peak_mask is not None:
-            # 确保 peak_mask 与当前特征维度匹配
-            if peak_mask.dim() == 2:  # [B,L]
-                peak_mask = peak_mask.unsqueeze(-1)  # [B,L,1]
-            
-            # 检查序列长度是否匹配
-            if peak_mask.size(1) != new_x.size(1):
-                # 动态调整 peak_mask 的序列长度
-                peak_mask = F.interpolate(
-                    peak_mask.transpose(1,2),  # [B,1,L]
-                    size=new_x.size(1),
-                    mode='linear',
-                    align_corners=False
-                ).transpose(1,2)  # [B,L,1]
-            
-            # 对异常点的注意力输出进行加权
-            new_x = new_x * (1 + peak_mask * 0.5)  # 对异常点增强50%的影响
-        
-        # 3. 残差连接和层归一化
+        # 残差连接
         x = x + self.dropout(new_x)
         y = x = self.norm1(x)
         
-        # 4. 前馈网络
-        y = self.dropout(self.activation(self.conv1(y.transpose(-1,1))))
-        y = self.dropout(self.conv2(y).transpose(-1,1))
-
-        return self.norm2(x+y), attn
+        # 卷积处理
+        y = y.transpose(-1, 1)  # [B, L, D] -> [B, D, L]
+        y = self.dropout(self.activation(self.conv1(y)))
+        y = self.dropout(self.conv2(y))
+        y = y.transpose(-1, 1)  # [B, D, L] -> [B, L, D]
+        
+        # 恢复原始形状
+        if len(original_shape) == 4:
+            y = y.reshape(original_shape)
+        
+        return self.norm2(x + y), attn
 
 class Encoder(nn.Module):
     def __init__(self, attn_layers, conv_layers=None, norm_layer=None):
@@ -79,39 +80,32 @@ class Encoder(nn.Module):
         self.conv_layers = nn.ModuleList(conv_layers) if conv_layers is not None else None
         self.norm = norm_layer
 
-    def forward(self, x, attn_mask=None, peak_mask=None):
-        attns = []
-        
-        # 1. 处理有卷积层的情况
-        if self.conv_layers is not None:
-            for attn_layer, conv_layer in zip(self.attn_layers, self.conv_layers):
-                x, attn = attn_layer(x, attn_mask=attn_mask, peak_mask=peak_mask)
-                x = conv_layer(x)  # 卷积层会改变序列长度
-                
-                # 如果存在 peak_mask 且序列长度改变，则调整 peak_mask
-                if peak_mask is not None:
-                    peak_mask = F.interpolate(
-                        peak_mask.float().transpose(1,2),  # [B,L,1] -> [B,1,L] (3D)
-                        size=x.size(1),
-                        mode='linear',
-                        align_corners=False
-                    ).transpose(1,2).to(x.dtype)  # [B,1,L'] -> [B,L',1]
-                
-                attns.append(attn)
-            
-            x, attn = self.attn_layers[-1](x, attn_mask=attn_mask, peak_mask=peak_mask)
-            attns.append(attn)
-        
-        # 2. 处理没有卷积层的情况
+    def forward(self, x, attn_mask=None):
+        # 输入维度预处理
+        if x.dim() == 4:  # [B, L, H, D]
+            B, L, H, D = x.shape
+            need_reshape = True
         else:
-            for attn_layer in self.attn_layers:
-                x, attn = attn_layer(x, attn_mask=attn_mask, peak_mask=peak_mask)
-                attns.append(attn)
-        
+            need_reshape = False
+            
+        attns = []
+        for i, attn_layer in enumerate(self.attn_layers):
+            if need_reshape:
+                x = x.reshape(B, L, -1)  # 合并最后两个维度
+                
+            x, attn = attn_layer(x, attn_mask=attn_mask)
+            attns.append(attn)
+            
+            if self.conv_layers is not None and i < len(self.conv_layers):
+                if need_reshape:
+                    x = x.reshape(B, -1, H, D)  # 恢复多头形状
+                x = self.conv_layers[i](x)
+                L = x.shape[1]  # 更新序列长度
+                
         if self.norm is not None:
             x = self.norm(x)
-        
-        return x, attns
+            
+        return (x, attns)
 
 class EncoderStack(nn.Module):
     def __init__(self, encoders, inp_lens):
@@ -119,27 +113,15 @@ class EncoderStack(nn.Module):
         self.encoders = nn.ModuleList(encoders)
         self.inp_lens = inp_lens
 
-    def forward(self, x, attn_mask=None, peak_mask=None):
-        x_stack = [] 
+    def forward(self, x, attn_mask=None):
+        x_stack = []
         attns = []
-        
         for i_len, encoder in zip(self.inp_lens, self.encoders):
-            inp_len = x.shape[1] // (2**i_len)
-            
-            # 调整 peak_mask 到当前编码器的输入长度
-            if peak_mask is not None:
-                current_peak_mask = peak_mask[:, -inp_len:]
-            else:
-                current_peak_mask = None
-                
+            inp_len = x.shape[1] // (2 ** i_len)
             x_s, attn = encoder(
-                x[:, -inp_len:, :], 
-                attn_mask=attn_mask, 
-                peak_mask=current_peak_mask
+                x[:, -inp_len:, :],
+                attn_mask=attn_mask
             )
-            
-            x_stack.append(x_s) 
+            x_stack.append(x_s)
             attns.append(attn)
-        
-        x = torch.cat(x_stack, -2)
-        return x, attns
+        return torch.cat(x_stack, -2), attns

@@ -18,16 +18,24 @@ def RMSE(pred, true):
     return np.sqrt(MSE(pred, true))
 
 def MAPE(pred, true):
-    return np.mean(np.abs((pred - true) / true))
+    return np.mean(np.abs((pred - true) / true)) * 100
 
 def MSPE(pred, true):
-    return np.mean(np.square((pred - true) / true))
+    return np.mean(np.square((pred - true) / true)) * 100
 
-def metric(pred, true):
+def metric(pred, true, scaler=None):
+    """添加scaler参数进行逆变换"""
+    if scaler is not None:
+        pred = scaler.inverse_transform(pred)  # 逆变换到原始量纲
+        true = scaler.inverse_transform(true)
+    
     mae = MAE(pred, true)
     mse = MSE(pred, true)
     rmse = RMSE(pred, true)
-    mape = MAPE(pred, true)
-    mspe = MSPE(pred, true)
     
-    return mae,mse,rmse,mape,mspe
+    # 处理MAPE/MSPE的除零问题
+    mask = true != 0  # 忽略真实值为0的情况
+    mape = np.mean(np.abs((pred[mask] - true[mask]) / true[mask])) * 100 if any(mask) else 0
+    mspe = np.mean(np.square((pred[mask] - true[mask]) / true[mask])) * 100 if any(mask) else 0
+    
+    return mae, mse, rmse, mape, mspe
